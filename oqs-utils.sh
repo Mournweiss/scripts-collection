@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 Maxim Selin (Mournweiss) <info@mournweiss.ru>
 #
+# SPDX-License-Identifier: Apache-2.0
+
 # oqs-utils: Post-Quantum Cryptography Utility
 #
 # Provides a simplified interface to the Docker/Podman image

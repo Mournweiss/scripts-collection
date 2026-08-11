@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+# SPDX-FileCopyrightText: 2026 Maxim Selin (Mournweiss) <info@mournweiss.ru>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # ANSI color codes
 COLOR_INFO="\033[0m"       # White (default)
 COLOR_WARN="\033[1;33m"    # Yellow
