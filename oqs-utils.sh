@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+#
+# oqs-utils: Post-Quantum Cryptography Utility
+#
+# Provides a simplified interface to the Docker/Podman image
+# ghcr.io/mournweiss/oqs-openssl for generating post-quantum keys,
+# certificates, and KEM secrets.
+#
+# Usage:
+#   ./oqs-utils.sh <command> [OPTIONS]
+#
+# Commands:
+#   kem-generate        Generate KEM keypair (encapsulation/decapsulation)
+#   sig-generate        Generate signature keypair (sign/verify)
+#   cert-generate       Generate X.509 certificate with PQ algorithm
+#   kem-encaps          Encapsulate shared secret for KEM
+#   list-algorithms     List all available PQ algorithms
+#   list-kems           List available KEM algorithms
+#   list-sigs           List available signature algorithms
+#   help                Show this help message
+#
+# Examples:
+#   ./oqs-utils.sh kem-generate --algorithm mlkem768
+#   ./oqs-utils.sh sig-generate --algorithm mldsa65 --output-dir ./keys
+#   ./oqs-utils.sh cert-generate --algorithm mldsa87 --cn "My PQ CA" --days 730
+#   ./oqs-utils.sh kem-encaps --algorithm mlkem768
+#   ./oqs-utils.sh list-kems
+#   ./oqs-utils.sh list-sigs
+#
+# Environment Variables:
+#   OQS_ALGORITHM           PQ algorithm (default: mlkem768)
+#   OQS_OUTPUT_DIR          Output directory (default: /tmp/)
+#   OQS_PREFIX              File prefix (default: oqs)
+#   OQS_FORMAT              Output format (default: keypair)
+#   OQS_KEY_TYPE            Key type: kem or sig (default: kem)
+#   OQS_DAYS                Certificate validity (default: 365)
+#   OQS_CN                  Common Name (default: OQS Test)
+#   OQS_CONTAINER_IMAGE     Container image (default: ghcr.io/mournweiss/oqs-openssl:latest-alpine)
+#   OQS_CONTAINER_ENGINE    Container engine: docker/podman (default: auto-detect)
+#   OQS_CONTAINER_RUN_OPTS  Additional container run options
+#   OQS_VERBOSE             Enable verbose output (default: false)
+#   CONTAINER_ENGINE        Global container engine override
+#
+
+set -euo pipefail
+
+# Load shell utilities for logging
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+source "$PROJECT_ROOT/scripts/shell_utils.sh"
+
+# Constants
+DEFAULT_CONTAINER_IMAGE="ghcr.io/mournweiss/oqs-openssl:latest-alpine"
+DEFAULT_OUTPUT_DIR="/tmp"
+DEFAULT_PREFIX="oqs"
+DEFAULT_ALGORITHM="mlkem768"
+DEFAULT_FORMAT="keypair"
+DEFAULT_KEY_TYPE="kem"
+DEFAULT_DAYS="365"
+DEFAULT_CN="OQS Test"
+DEFAULT_CONTAINER_ENGINE="docker"
+
+# Variables
+CONTAINER_ENGINE="${OQS_CONTAINER_ENGINE:-${CONTAINER_ENGINE:-$DEFAULT_CONTAINER_ENGINE}}"
+CONTAINER_IMAGE="${OQS_CONTAINER_IMAGE:-$DEFAULT_CONTAINER_IMAGE}"
+OUTPUT_DIR="${OQS_OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
+PREFIX="${OQS_PREFIX:-$DEFAULT_PREFIX}"
+ALGORITHM="${OQS_ALGORITHM:-$DEFAULT_ALGORITHM}"
+FORMAT="${OQS_FORMAT:-$DEFAULT_FORMAT}"
+KEY_TYPE="${OQS_KEY_TYPE:-$DEFAULT_KEY_TYPE}"
+DAYS="${OQS_DAYS:-$DEFAULT_DAYS}"
+CN="${OQS_CN:-$DEFAULT_CN}"
+CONTAINER_RUN_OPTS="${OQS_CONTAINER_RUN_OPTS:-}"
+VERBOSE="${OQS_VERBOSE:-false}"
+COMMAND=""
+
+# Resolve the available container engine (docker or podman).
+# Automatically detects if the specified engine is available,
+# falls back to docker, then podman.
+#
+# Parameters:
+#   None
+#
+# Returns:
+#   None (sets the CONTAINER_ENGINE global variable)
+resolve_container_engine() {
+    if command -v "$CONTAINER_ENGINE" &>/dev/null; then
+        info "Using container engine: $CONTAINER_ENGINE"
+        return 0
+    fi
+
+    # Auto-detect: try docker first
+    if command -v docker &>/dev/null; then
+        warn "Specified engine '$CONTAINER_ENGINE' not found, falling back to docker"
+        CONTAINER_ENGINE="docker"
+        return 0
+    fi
+
+    # Then try podman
+    if command -v podman &>/dev/null; then
+        warn "Specified engine '$CONTAINER_ENGINE' not found, falling back to podman"
+        CONTAINER_ENGINE="podman"
+        return 0
+    fi
+
+    error "Neither docker nor podman is installed. Please install one of them."
+}
+
+# Validate input parameters.
+#
+# Parameters:
+#   None
+#
+# Returns:
+#   None
+validate_inputs() {
+    # Check if output directory exists
+    if [[ ! -d "$OUTPUT_DIR" ]]; then
+        error "Output directory does not exist: $OUTPUT_DIR"
+    fi
+
+    # Check required variables
+    if [[ -z "$ALGORITHM" ]]; then
+        error "Algorithm is not set. Use --algorithm or set OQS_ALGORITHM."
+    fi
+}
+
+# Check if the container engine is available.
+#
+# Parameters:
+#   None
+#
+# Returns:
+#   None
+check_container_engine() {
+    if ! command -v "$CONTAINER_ENGINE" &>/dev/null; then
+        error "Container engine '$CONTAINER_ENGINE' is not installed or not in PATH"
+    fi
+}
+
+# List available KEM algorithms from the container.
+#
+# Parameters:
+#   None
+#
+# Returns:
+#   None
+cmd_list_kems() {
+    info "Listing KEM algorithms..."
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS "$CONTAINER_IMAGE" \
+        openssl list -kem-algorithms -provider oqsprovider
+}
+
+# List available signature algorithms from the container.
+#
+# Parameters:
+#   None
+#
+# Returns:
+#   None
+cmd_list_sigs() {
+    info "Listing Signature algorithms..."
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS "$CONTAINER_IMAGE" \
+        openssl list -signature-algorithms -provider oqsprovider
+}
+
+# Generate KEM keypair (encapsulation/decapsulation keys).
+#
+# Parameters:
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX, FORMAT)
+#
+# Returns:
+#   None
+cmd_kem_generate() {
+    local output_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.pem"
+    local public_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-public.pem"
+    local der_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.der"
+
+    info "Generating KEM keypair with algorithm: $ALGORITHM"
+    info "Container engine: $CONTAINER_ENGINE"
+    info "Output directory: $OUTPUT_DIR"
+    info "File prefix: $PREFIX"
+
+    # Generate private key using genpkey
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl genpkey -algorithm "$ALGORITHM" \
+        -out "/output/${PREFIX}-private.pem"
+
+    # Extract public key
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl pkey -in "/output/${PREFIX}-private.pem" \
+        -pubout -out "/output/${PREFIX}-public.pem"
+
+    # Convert to DER format
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl pkey -in "/output/${PREFIX}-private.pem" \
+        -outform DER -out "/output/${PREFIX}-private.der"
+
+    # Set restrictive permissions on private keys
+    chmod 0600 "$output_file" "$der_file" 2>/dev/null || true
+
+    success "KEM keypair generated: $output_file, $public_file, $der_file"
+}
+
+# Generate signature keypair (signing/verification keys).
+#
+# Parameters:
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX)
+#
+# Returns:
+#   None
+cmd_sig_generate() {
+    local output_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.pem"
+    local public_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-public.pem"
+
+    info "Generating Signature keypair with algorithm: $ALGORITHM"
+    info "Container engine: $CONTAINER_ENGINE"
+    info "Output directory: $OUTPUT_DIR"
+    info "File prefix: $PREFIX"
+
+    # Generate private key
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl genpkey -algorithm "$ALGORITHM" \
+        -out "/output/${PREFIX}-private.pem"
+
+    # Extract public key
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl pkey -in "/output/${PREFIX}-private.pem" \
+        -pubout -out "/output/${PREFIX}-public.pem"
+
+    # Convert to DER format
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl pkey -in "/output/${PREFIX}-private.pem" \
+        -outform DER -out "/output/${PREFIX}-private.der"
+
+    # Set restrictive permissions on private key
+    chmod 0600 "$output_file" 2>/dev/null || true
+
+    success "Signature keypair generated: $output_file, $public_file"
+}
+
+# Generate self-signed X.509 certificate with post-quantum algorithm.
+#
+# Parameters:
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX, CN, DAYS)
+#
+# Returns:
+#   None
+cmd_cert_generate() {
+    local cert_file="${OUTPUT_DIR}/${PREFIX}-ca.crt"
+    local key_file="${OUTPUT_DIR}/${PREFIX}-ca.key"
+
+    info "Generating self-signed certificate with algorithm: $ALGORITHM"
+    info "Container engine: $CONTAINER_ENGINE"
+    info "Common Name: $CN"
+    info "Validity: $DAYS days"
+    info "Output directory: $OUTPUT_DIR"
+
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl req -x509 -new -newkey "$ALGORITHM" \
+        -keyout "/output/${PREFIX}-ca.key" \
+        -out "/output/${PREFIX}-ca.crt" \
+        -nodes \
+        -subj "/CN=$CN" \
+        -days "$DAYS"
+
+    # Set restrictive permissions on private key
+    chmod 0600 "$key_file" 2>/dev/null || true
+
+    success "Certificate generated: $cert_file, $key_file"
+}
+
+# Encapsulate a shared secret using KEM.
+# Requires a previously generated keypair.
+# Uses `openssl pkeyutl -encap` with `-kemop encap` for KEM encapsulation.
+#
+# Parameters:
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX)
+#
+# Returns:
+#   None
+cmd_kem_encaps() {
+    local private_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.pem"
+    local public_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-public.pem"
+    local encaps_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-encapsulated"
+    local shared_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-shared-secret"
+
+    info "Encapsulating KEM secret with algorithm: $ALGORITHM"
+    info "Container engine: $CONTAINER_ENGINE"
+    info "Output directory: $OUTPUT_DIR"
+
+    # Check if required keys exist
+    if [[ ! -f "$private_file" ]]; then
+        warn "Private key not found: $private_file. Generate keys first using kem-generate."
+        return 1
+    fi
+
+    if [[ ! -f "$public_file" ]]; then
+        warn "Public key not found: $public_file. Generate keys first using kem-generate."
+        return 1
+    fi
+
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl pkeyutl -encap \
+        -inkey "/output/${PREFIX}-private.pem" \
+        -kemop encap \
+        -pubin -in "/output/${PREFIX}-public.pem" \
+        -out "/output/${PREFIX}-encapsulated" \
+        -secret "/output/${PREFIX}-shared-secret"
+
+    success "KEM encapsulation completed: $encaps_file, $shared_file"
+}
+
+# Decapsulate a shared secret using KEM.
+# Requires a previously generated keypair and an encapsulated secret.
+# Uses `openssl pkeyutl -decap` with `-kemop decap` for KEM decapsulation.
+#
+# Parameters:
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX)
+#
+# Returns:
+#   None
+cmd_kem_decaps() {
+    local private_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.pem"
+    local encaps_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-encapsulated"
+    local shared_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-shared-secret-decap"
+
+    info "Decapsulating KEM secret with algorithm: $ALGORITHM"
+    info "Container engine: $CONTAINER_ENGINE"
+    info "Output directory: $OUTPUT_DIR"
+
+    # Check if required files exist
+    if [[ ! -f "$private_file" ]]; then
+        warn "Private key not found: $private_file. Generate keys first using kem-generate."
+        return 1
+    fi
+
+    if [[ ! -f "$encaps_file" ]]; then
+        warn "Encapsulated secret not found: $encaps_file. Encapsulate first using kem-encaps."
+        return 1
+    fi
+
+    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        -v "$OUTPUT_DIR:/output" \
+        "$CONTAINER_IMAGE" \
+        openssl pkeyutl -decap \
+        -inkey "/output/${PREFIX}-private.pem" \
+        -kemop decap \
+        -in "/output/${PREFIX}-encapsulated" \
+        -out "/output/${PREFIX}-shared-secret-decap"
+
+    success "KEM decapsulation completed: $shared_file"
+}
+
+# Display help message with usage instructions.
+#
+# Parameters:
+#   None
+#
+# Returns:
+#   None
+show_help() {
+    cat <<EOF
+Usage: $(basename "$0") <command> [OPTIONS]
+
+OQS Utils - Post-Quantum Cryptography Utility
+
+Provides a simplified interface to the oqs-openssl container image
+for generating post-quantum keys, certificates, and KEM secrets.
+
+Commands:
+    kem-generate        Generate KEM keypair (encapsulation/decapsulation)
+    sig-generate        Generate signature keypair (sign/verify)
+    cert-generate       Generate X.509 certificate with PQ algorithm
+    kem-encaps          Encapsulate shared secret for KEM
+    kem-decaps          Decapsulate shared secret for KEM
+    list-algorithms     List all available PQ algorithms
+    list-kems           List available KEM algorithms
+    list-sigs           List available signature algorithms
+    help                Show this help message
+
+Options:
+    --algorithm ALG             PQ algorithm (default: mlkem768)
+    --output-dir DIR            Output directory (default: /tmp/)
+    --prefix PREFIX             File prefix (default: oqs)
+    --format FMT                Output format (default: keypair)
+    --key-type TYPE             Key type: kem or sig (default: kem)
+    --days DAYS                 Certificate validity (default: 365)
+    --cn CN                     Common Name for certificate (default: OQS Test)
+    --container-image IMG       Container image (default: ghcr.io/mournweiss/oqs-openssl:latest-alpine)
+    --container-engine ENGINE   Container engine: docker/podman (default: auto-detect)
+    --container-run-opts OPTS   Additional container run options
+    --verbose                   Enable verbose output
+    --help, -h                  Show this help message
+
+Environment Variables:
+    OQS_ALGORITHM             PQ algorithm
+    OQS_OUTPUT_DIR            Output directory
+    OQS_PREFIX                File prefix
+    OQS_FORMAT                Output format
+    OQS_KEY_TYPE              Key type (kem/sig)
+    OQS_DAYS                  Certificate validity
+    OQS_CN                    Common Name
+    OQS_CONTAINER_IMAGE       Container image
+    OQS_CONTAINER_ENGINE      Container engine (docker/podman)
+    OQS_CONTAINER_RUN_OPTS    Additional container run options
+    OQS_VERBOSE               Enable verbose output
+    CONTAINER_ENGINE          Global container engine override
+
+Examples:
+    $(basename "$0") kem-generate --algorithm mlkem768
+    $(basename "$0") sig-generate --algorithm mldsa65 --output-dir ./keys
+    $(basename "$0") cert-generate --algorithm mldsa87 --cn "My PQ CA" --days 730
+    $(basename "$0") kem-encaps --algorithm mlkem768
+    $(basename "$0") list-kems
+    $(basename "$0") list-sigs
+
+    # Using Podman:
+    CONTAINER_ENGINE=podman $(basename "$0") kem-generate --algorithm mlkem768
+    $(basename "$0") --container-engine podman kem-generate --algorithm mlkem768
+
+    # Using custom image:
+    OQS_CONTAINER_IMAGE=myregistry.com/oqs-openssl:latest $(basename "$0") kem-generate
+    $(basename "$0") --container-image myregistry.com/oqs-openssl:latest kem-generate
+
+EOF
+}
+
+# Parse command-line arguments and set global variables.
+#
+# Parameters:
+#   $@: array - command-line arguments
+#
+# Returns:
+#   None (sets global variables: ALGORITHM, OUTPUT_DIR, PREFIX, etc.)
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --algorithm)
+                ALGORITHM="$2"
+                shift 2
+                ;;
+            --output-dir)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --prefix)
+                PREFIX="$2"
+                shift 2
+                ;;
+            --format)
+                FORMAT="$2"
+                shift 2
+                ;;
+            --key-type)
+                KEY_TYPE="$2"
+                shift 2
+                ;;
+            --days)
+                DAYS="$2"
+                shift 2
+                ;;
+            --cn)
+                CN="$2"
+                shift 2
+                ;;
+            --container-image)
+                CONTAINER_IMAGE="$2"
+                shift 2
+                ;;
+            --container-engine)
+                CONTAINER_ENGINE="$2"
+                shift 2
+                ;;
+            --container-run-opts)
+                CONTAINER_RUN_OPTS="$2"
+                shift 2
+                ;;
+            --verbose)
+                VERBOSE="true"
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                if [[ -z "$COMMAND" ]]; then
+                    COMMAND="$1"
+                else
+                    warn "Unknown argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+}
+
+# Main
+main() {
+    parse_args "$@"
+    validate_inputs
+    resolve_container_engine
+    check_container_engine
+
+    case "${COMMAND:-help}" in
+        kem-generate)   cmd_kem_generate ;;
+        sig-generate)   cmd_sig_generate ;;
+        cert-generate)  cmd_cert_generate ;;
+        kem-encaps)     cmd_kem_encaps ;;
+        kem-decaps)     cmd_kem_decaps ;;
+        list-kems)      cmd_list_kems ;;
+        list-sigs)      cmd_list_sigs ;;
+        list-algorithms)
+            cmd_list_kems
+            cmd_list_sigs
+            ;;
+        help|--help|-h) show_help ;;
+        *)
+            error "Unknown command: $COMMAND"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
