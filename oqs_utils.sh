@@ -459,10 +459,10 @@ cmd_kem_decaps() {
         -v "$OUTPUT_DIR:/output" \
         "$CONTAINER_IMAGE" \
         openssl pkeyutl -decap \
-        -inkey "/output/${PREFIX}-private.pem" \
+        -inkey "/output/${PREFIX}-${ALGORITHM}-private.pem" \
         -kemop decap \
-        -in "/output/${PREFIX}-encapsulated" \
-        -out "/output/${PREFIX}-shared-secret-decap"
+        -in "/output/${PREFIX}-${ALGORITHM}-encapsulated" \
+        -out "/output/${PREFIX}-${ALGORITHM}-shared-secret-decap"
 
     success "KEM decapsulation completed: $shared_file"
 }
