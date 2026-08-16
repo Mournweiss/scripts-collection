@@ -50,7 +50,8 @@ set -euo pipefail
 
 # Load shell utilities for logging
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
-source "$PROJECT_ROOT/shell_utils.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/shell_utils.sh"
 
 # Constants
 DEFAULT_CONTAINER_IMAGE="ghcr.io/mournweiss/oqs-openssl:latest-alpine"
