@@ -6,16 +6,15 @@
 
 # oqs-utils: Post-Quantum Cryptography Utility
 #
-# Provides a simplified interface to the Docker/Podman image
-# ghcr.io/mournweiss/oqs-openssl for generating post-quantum keys,
-# certificates, and KEM secrets.
+# Provides a simplified interface to the ghcr.io/mournweiss/oqs-openssl image
+# for generating post-quantum keys, certificates, and KEM secrets.
 #
 # Usage:
 #   ./oqs-utils.sh <command> [OPTIONS]
 #
 # Commands:
-#   kem-generate        Generate KEM keypair (encapsulation/decapsulation)
-#   sig-generate        Generate signature keypair (sign/verify)
+#   kem-generate        Generate KEM key (keypair or single private)
+#   sig-generate        Generate signature key (keypair or single private)
 #   cert-generate       Generate X.509 certificate with PQ algorithm
 #   kem-encaps          Encapsulate shared secret for KEM
 #   list-algorithms     List all available PQ algorithms
@@ -35,7 +34,8 @@
 #   OQS_ALGORITHM           PQ algorithm (default: mlkem768)
 #   OQS_OUTPUT_DIR          Output directory (default: /tmp/)
 #   OQS_PREFIX              File prefix (default: oqs)
-#   OQS_FORMAT              Output format (default: keypair)
+#   OQS_MODE                Generation mode: keypair, single (default: keypair)
+#   OQS_KEY_FORMAT          Key format for single mode: pem, der (default: pem)
 #   OQS_KEY_TYPE            Key type: kem or sig (default: kem)
 #   OQS_DAYS                Certificate validity (default: 365)
 #   OQS_CN                  Common Name (default: OQS Test)
@@ -49,15 +49,16 @@
 set -euo pipefail
 
 # Load shell utilities for logging
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-source "$PROJECT_ROOT/scripts/shell_utils.sh"
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+source "$PROJECT_ROOT/shell_utils.sh"
 
 # Constants
 DEFAULT_CONTAINER_IMAGE="ghcr.io/mournweiss/oqs-openssl:latest-alpine"
 DEFAULT_OUTPUT_DIR="/tmp"
 DEFAULT_PREFIX="oqs"
 DEFAULT_ALGORITHM="mlkem768"
-DEFAULT_FORMAT="keypair"
+DEFAULT_MODE="keypair"
+DEFAULT_KEY_FORMAT="pem"
 DEFAULT_KEY_TYPE="kem"
 DEFAULT_DAYS="365"
 DEFAULT_CN="OQS Test"
@@ -69,7 +70,8 @@ CONTAINER_IMAGE="${OQS_CONTAINER_IMAGE:-$DEFAULT_CONTAINER_IMAGE}"
 OUTPUT_DIR="${OQS_OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
 PREFIX="${OQS_PREFIX:-$DEFAULT_PREFIX}"
 ALGORITHM="${OQS_ALGORITHM:-$DEFAULT_ALGORITHM}"
-FORMAT="${OQS_FORMAT:-$DEFAULT_FORMAT}"
+MODE="${OQS_MODE:-$DEFAULT_MODE}"
+KEY_FORMAT="${OQS_KEY_FORMAT:-$DEFAULT_KEY_FORMAT}"
 KEY_TYPE="${OQS_KEY_TYPE:-$DEFAULT_KEY_TYPE}"
 DAYS="${OQS_DAYS:-$DEFAULT_DAYS}"
 CN="${OQS_CN:-$DEFAULT_CN}"
@@ -117,9 +119,13 @@ resolve_container_engine() {
 # Returns:
 #   None
 validate_inputs() {
-    # Check if output directory exists
+    # Attempt to create output directory if it does not exist
     if [[ ! -d "$OUTPUT_DIR" ]]; then
-        error "Output directory does not exist: $OUTPUT_DIR"
+        info "Output directory does not exist: $OUTPUT_DIR. Attempting to create..."
+        if ! mkdir -p "$OUTPUT_DIR" 2>/dev/null; then
+            error "Failed to create output directory: $OUTPUT_DIR"
+        fi
+        success "Output directory created: $OUTPUT_DIR"
     fi
 
     # Check required variables
@@ -167,91 +173,181 @@ cmd_list_sigs() {
         openssl list -signature-algorithms -provider oqsprovider
 }
 
-# Generate KEM keypair (encapsulation/decapsulation keys).
+# Generate a key in DER format inside the container.
+# Supports both private keys (genpkey) and public key extraction (pkey -pubout).
+# All paths are automatically converted to container-internal paths (/output/...).
+# The intermediate PEM file is never written to the host filesystem.
 #
 # Parameters:
-#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX, FORMAT)
+#   $1: key_type        - "private" or "public"
+#   $2: algorithm       - PQ algorithm name (required for "private" type)
+#   $3: output_dir      - host output directory (for volume mount)
+#   $4: prefix          - file prefix
+#   $5: input_pem_path  - container-internal path to input PEM (for "public" type, optional)
+#
+# Returns:
+#   None
+_generate_der() {
+    local key_type="$1"
+    local algorithm="$2"
+    local output_dir="$3"
+    local prefix="$4"
+    local input_pem_path="${5:-}"
+
+    if [[ "$key_type" == "private" ]]; then
+        # Generate private key directly in DER format
+        "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            -v "$output_dir:/output" \
+            "$CONTAINER_IMAGE" \
+            openssl genpkey -algorithm "$algorithm" \
+            -outform DER \
+            -out "/output/${prefix}-${algorithm}-private.der"
+
+        chmod 0600 "${output_dir}/${prefix}-${algorithm}-private.der" 2>/dev/null || true
+        success "Private key generated: ${output_dir}/${prefix}-${algorithm}-private.der"
+    elif [[ "$key_type" == "public" ]]; then
+        # Generate public key in DER format from existing private key
+        "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            -v "$output_dir:/output" \
+            "$CONTAINER_IMAGE" \
+            openssl pkey -in "$input_pem_path" \
+            -pubout -outform DER \
+            -out "/output/${prefix}-${algorithm}-public.der"
+
+        chmod 0600 "${output_dir}/${prefix}-${algorithm}-public.der" 2>/dev/null || true
+        success "Public key generated: ${output_dir}/${prefix}-${algorithm}-public.der"
+    fi
+}
+
+# Generate private key using the containerized OpenSSL.
+#
+# Parameters:
+#   $1: algorithm - PQ algorithm name
+#   $2: output_dir - directory for output files
+#   $3: prefix - file prefix
+#   $4: key_format - output format (pem, der)
+#
+# Returns:
+#   None
+cmd_generate_private_key() {
+    local algorithm="$1"
+    local output_dir="$2"
+    local prefix="$3"
+    local key_format="${4:-pem}"
+
+    local private_pem_file="${output_dir}/${prefix}-${algorithm}-private.pem"
+
+    if [[ "$key_format" == "der" ]]; then
+        _generate_der "private" "$algorithm" "$output_dir" "$prefix"
+    else
+        # Generate private key in PEM format
+        "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            -v "$output_dir:/output" \
+            "$CONTAINER_IMAGE" \
+            openssl genpkey -algorithm "$algorithm" \
+            -out "/output/${prefix}-${algorithm}-private.pem"
+
+        # Set restrictive permissions on private key
+        chmod 0600 "$private_pem_file" 2>/dev/null || true
+        success "Private key generated: $private_pem_file"
+    fi
+}
+
+# Generate public key from existing private key.
+#
+# Parameters:
+#   $1: algorithm - PQ algorithm name
+#   $2: output_dir - directory with private key
+#   $3: prefix - file prefix
+#   $4: key_format - output format (pem, der)
+#
+# Returns:
+#   None
+cmd_generate_public_key() {
+    local algorithm="$1"
+    local output_dir="$2"
+    local prefix="$3"
+    local key_format="${4:-pem}"
+
+    local private_file="${output_dir}/${prefix}-${algorithm}-private.pem"
+    local public_file="${output_dir}/${prefix}-${algorithm}-public.pem"
+    local public_der_file="${output_dir}/${prefix}-${algorithm}-public.der"
+
+    if [[ ! -f "$private_file" ]]; then
+        error "Private key not found: $private_file. Generate it first using --mode keypair."
+    fi
+
+    if [[ "$key_format" == "der" ]]; then
+        _generate_der "public" "$algorithm" "$output_dir" "$prefix" \
+                      "/output/${prefix}-${algorithm}-private.pem"
+    else
+        # Generate public key in PEM format
+        "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            -v "$output_dir:/output" \
+            "$CONTAINER_IMAGE" \
+            openssl pkey -in "/output/${prefix}-${algorithm}-private.pem" \
+            -pubout -out "/output/${prefix}-${algorithm}-public.pem"
+
+        success "Public key generated: $public_file"
+    fi
+}
+
+# Generate KEM key (keypair or single private key).
+#
+# Parameters:
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX, MODE, KEY_FORMAT)
 #
 # Returns:
 #   None
 cmd_kem_generate() {
-    local output_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.pem"
-    local public_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-public.pem"
-    local der_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.der"
-
-    info "Generating KEM keypair with algorithm: $ALGORITHM"
+    info "Generating KEM key with algorithm: $ALGORITHM"
     info "Container engine: $CONTAINER_ENGINE"
     info "Output directory: $OUTPUT_DIR"
     info "File prefix: $PREFIX"
+    info "Mode: $MODE"
+    info "Key format: $KEY_FORMAT"
 
-    # Generate private key using genpkey
-    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
-        -v "$OUTPUT_DIR:/output" \
-        "$CONTAINER_IMAGE" \
-        openssl genpkey -algorithm "$ALGORITHM" \
-        -out "/output/${PREFIX}-private.pem"
-
-    # Extract public key
-    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
-        -v "$OUTPUT_DIR:/output" \
-        "$CONTAINER_IMAGE" \
-        openssl pkey -in "/output/${PREFIX}-private.pem" \
-        -pubout -out "/output/${PREFIX}-public.pem"
-
-    # Convert to DER format
-    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
-        -v "$OUTPUT_DIR:/output" \
-        "$CONTAINER_IMAGE" \
-        openssl pkey -in "/output/${PREFIX}-private.pem" \
-        -outform DER -out "/output/${PREFIX}-private.der"
-
-    # Set restrictive permissions on private keys
-    chmod 0600 "$output_file" "$der_file" 2>/dev/null || true
-
-    success "KEM keypair generated: $output_file, $public_file, $der_file"
+    case "$MODE" in
+        keypair)
+            cmd_generate_private_key "$ALGORITHM" "$OUTPUT_DIR" "$PREFIX" "pem"
+            cmd_generate_public_key "$ALGORITHM" "$OUTPUT_DIR" "$PREFIX" "pem"
+            ;;
+        single)
+            cmd_generate_private_key "$ALGORITHM" "$OUTPUT_DIR" "$PREFIX" "$KEY_FORMAT"
+            ;;
+        *)
+            error "Unknown mode: $MODE. Allowed: keypair, single"
+            ;;
+    esac
 }
 
-# Generate signature keypair (signing/verification keys).
+# Generate signature key (signing/verification keys).
 #
 # Parameters:
-#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX)
+#   None (uses global variables: ALGORITHM, OUTPUT_DIR, PREFIX, MODE, KEY_FORMAT)
 #
 # Returns:
 #   None
 cmd_sig_generate() {
-    local output_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-private.pem"
-    local public_file="${OUTPUT_DIR}/${PREFIX}-${ALGORITHM}-public.pem"
-
-    info "Generating Signature keypair with algorithm: $ALGORITHM"
+    info "Generating Signature key with algorithm: $ALGORITHM"
     info "Container engine: $CONTAINER_ENGINE"
     info "Output directory: $OUTPUT_DIR"
     info "File prefix: $PREFIX"
+    info "Mode: $MODE"
+    info "Key format: $KEY_FORMAT"
 
-    # Generate private key
-    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
-        -v "$OUTPUT_DIR:/output" \
-        "$CONTAINER_IMAGE" \
-        openssl genpkey -algorithm "$ALGORITHM" \
-        -out "/output/${PREFIX}-private.pem"
-
-    # Extract public key
-    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
-        -v "$OUTPUT_DIR:/output" \
-        "$CONTAINER_IMAGE" \
-        openssl pkey -in "/output/${PREFIX}-private.pem" \
-        -pubout -out "/output/${PREFIX}-public.pem"
-
-    # Convert to DER format
-    "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
-        -v "$OUTPUT_DIR:/output" \
-        "$CONTAINER_IMAGE" \
-        openssl pkey -in "/output/${PREFIX}-private.pem" \
-        -outform DER -out "/output/${PREFIX}-private.der"
-
-    # Set restrictive permissions on private key
-    chmod 0600 "$output_file" 2>/dev/null || true
-
-    success "Signature keypair generated: $output_file, $public_file"
+    case "$MODE" in
+        keypair)
+            cmd_generate_private_key "$ALGORITHM" "$OUTPUT_DIR" "$PREFIX" "pem"
+            cmd_generate_public_key "$ALGORITHM" "$OUTPUT_DIR" "$PREFIX" "pem"
+            ;;
+        single)
+            cmd_generate_private_key "$ALGORITHM" "$OUTPUT_DIR" "$PREFIX" "$KEY_FORMAT"
+            ;;
+        *)
+            error "Unknown mode: $MODE. Allowed: keypair, single"
+            ;;
+    esac
 }
 
 # Generate self-signed X.509 certificate with post-quantum algorithm.
@@ -321,11 +417,11 @@ cmd_kem_encaps() {
         -v "$OUTPUT_DIR:/output" \
         "$CONTAINER_IMAGE" \
         openssl pkeyutl -encap \
-        -inkey "/output/${PREFIX}-private.pem" \
+        -inkey "/output/${PREFIX}-${ALGORITHM}-private.pem" \
         -kemop encap \
-        -pubin -in "/output/${PREFIX}-public.pem" \
-        -out "/output/${PREFIX}-encapsulated" \
-        -secret "/output/${PREFIX}-shared-secret"
+        -pubin -in "/output/${PREFIX}-${ALGORITHM}-public.pem" \
+        -out "/output/${PREFIX}-${ALGORITHM}-encapsulated" \
+        -secret "/output/${PREFIX}-${ALGORITHM}-shared-secret"
 
     success "KEM encapsulation completed: $encaps_file, $shared_file"
 }
@@ -388,8 +484,8 @@ Provides a simplified interface to the oqs-openssl container image
 for generating post-quantum keys, certificates, and KEM secrets.
 
 Commands:
-    kem-generate        Generate KEM keypair (encapsulation/decapsulation)
-    sig-generate        Generate signature keypair (sign/verify)
+    kem-generate        Generate KEM key (encapsulation/decapsulation)
+    sig-generate        Generate signature key (sign/verify)
     cert-generate       Generate X.509 certificate with PQ algorithm
     kem-encaps          Encapsulate shared secret for KEM
     kem-decaps          Decapsulate shared secret for KEM
@@ -402,7 +498,8 @@ Options:
     --algorithm ALG             PQ algorithm (default: mlkem768)
     --output-dir DIR            Output directory (default: /tmp/)
     --prefix PREFIX             File prefix (default: oqs)
-    --format FMT                Output format (default: keypair)
+    --mode MODE                 Generation mode: keypair, single (default: keypair)
+    --key-format FMT            Key format for single mode: pem, der (default: pem)
     --key-type TYPE             Key type: kem or sig (default: kem)
     --days DAYS                 Certificate validity (default: 365)
     --cn CN                     Common Name for certificate (default: OQS Test)
@@ -416,7 +513,8 @@ Environment Variables:
     OQS_ALGORITHM             PQ algorithm
     OQS_OUTPUT_DIR            Output directory
     OQS_PREFIX                File prefix
-    OQS_FORMAT                Output format
+    OQS_MODE                  Generation mode (keypair/single)
+    OQS_KEY_FORMAT            Key format for single mode (pem/der)
     OQS_KEY_TYPE              Key type (kem/sig)
     OQS_DAYS                  Certificate validity
     OQS_CN                    Common Name
@@ -427,10 +525,20 @@ Environment Variables:
     CONTAINER_ENGINE          Global container engine override
 
 Examples:
+    # Generate full keypair (default)
     $(basename "$0") kem-generate --algorithm mlkem768
     $(basename "$0") sig-generate --algorithm mldsa65 --output-dir ./keys
+
+    # Generate only private key in PEM format (single mode)
+    $(basename "$0") kem-generate --algorithm mlkem768 --mode single
+
+    # Generate only private key in DER format (single mode)
+    $(basename "$0") kem-generate --algorithm mlkem768 --mode single --key-format der
+
+    # Generate self-signed certificate
     $(basename "$0") cert-generate --algorithm mldsa87 --cn "My PQ CA" --days 730
-    $(basename "$0") kem-encaps --algorithm mlkem768
+
+    # List available algorithms
     $(basename "$0") list-kems
     $(basename "$0") list-sigs
 
@@ -451,7 +559,7 @@ EOF
 #   $@: array - command-line arguments
 #
 # Returns:
-#   None (sets global variables: ALGORITHM, OUTPUT_DIR, PREFIX, etc.)
+#   None (sets global variables: ALGORITHM, OUTPUT_DIR, PREFIX, MODE, KEY_FORMAT, etc.)
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -467,8 +575,20 @@ parse_args() {
                 PREFIX="$2"
                 shift 2
                 ;;
-            --format)
-                FORMAT="$2"
+            --mode)
+                MODE="$2"
+                case "$MODE" in
+                    keypair|single) ;;
+                    *) error "Invalid mode: $MODE. Allowed: keypair, single" ;;
+                esac
+                shift 2
+                ;;
+            --key-format)
+                KEY_FORMAT="$2"
+                case "$KEY_FORMAT" in
+                    pem|der) ;;
+                    *) error "Invalid key format: $KEY_FORMAT. Allowed: pem, der" ;;
+                esac
                 shift 2
                 ;;
             --key-type)
