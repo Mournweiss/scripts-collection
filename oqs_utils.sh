@@ -79,6 +79,8 @@ CN="${OQS_CN:-$DEFAULT_CN}"
 CONTAINER_RUN_OPTS="${OQS_CONTAINER_RUN_OPTS:-}"
 VERBOSE="${OQS_VERBOSE:-false}"
 COMMAND=""
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 # Resolve the available container engine (docker or podman).
 # Automatically detects if the specified engine is available,
@@ -198,24 +200,26 @@ _generate_der() {
     if [[ "$key_type" == "private" ]]; then
         # Generate private key directly in DER format
         "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            --user "${HOST_UID}:${HOST_GID}" \
             -v "$output_dir:/output" \
             "$CONTAINER_IMAGE" \
             openssl genpkey -algorithm "$algorithm" \
             -outform DER \
             -out "/output/${prefix}-${algorithm}-private.der"
 
-        chmod 0600 "${output_dir}/${prefix}-${algorithm}-private.der" 2>/dev/null || true
+        chmod 0600 "${output_dir}/${prefix}-${algorithm}-private.der"
         success "Private key generated: ${output_dir}/${prefix}-${algorithm}-private.der"
     elif [[ "$key_type" == "public" ]]; then
         # Generate public key in DER format from existing private key
         "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            --user "${HOST_UID}:${HOST_GID}" \
             -v "$output_dir:/output" \
             "$CONTAINER_IMAGE" \
             openssl pkey -in "$input_pem_path" \
             -pubout -outform DER \
             -out "/output/${prefix}-${algorithm}-public.der"
 
-        chmod 0600 "${output_dir}/${prefix}-${algorithm}-public.der" 2>/dev/null || true
+        chmod 0600 "${output_dir}/${prefix}-${algorithm}-public.der"
         success "Public key generated: ${output_dir}/${prefix}-${algorithm}-public.der"
     fi
 }
@@ -243,13 +247,13 @@ cmd_generate_private_key() {
     else
         # Generate private key in PEM format
         "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            --user "${HOST_UID}:${HOST_GID}" \
             -v "$output_dir:/output" \
             "$CONTAINER_IMAGE" \
             openssl genpkey -algorithm "$algorithm" \
             -out "/output/${prefix}-${algorithm}-private.pem"
 
-        # Set restrictive permissions on private key
-        chmod 0600 "$private_pem_file" 2>/dev/null || true
+        chmod 0600 "$private_pem_file"
         success "Private key generated: $private_pem_file"
     fi
 }
@@ -284,6 +288,7 @@ cmd_generate_public_key() {
     else
         # Generate public key in PEM format
         "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+            --user "${HOST_UID}:${HOST_GID}" \
             -v "$output_dir:/output" \
             "$CONTAINER_IMAGE" \
             openssl pkey -in "/output/${prefix}-${algorithm}-private.pem" \
@@ -369,6 +374,7 @@ cmd_cert_generate() {
     info "Output directory: $OUTPUT_DIR"
 
     "$CONTAINER_ENGINE" run --rm $CONTAINER_RUN_OPTS \
+        --user "${HOST_UID}:${HOST_GID}" \
         -v "$OUTPUT_DIR:/output" \
         "$CONTAINER_IMAGE" \
         openssl req -x509 -new -newkey "$ALGORITHM" \
@@ -378,9 +384,7 @@ cmd_cert_generate() {
         -subj "/CN=$CN" \
         -days "$DAYS"
 
-    # Set restrictive permissions on private key
-    chmod 0600 "$key_file" 2>/dev/null || true
-
+    chmod 0600 "$key_file"
     success "Certificate generated: $cert_file, $key_file"
 }
 
